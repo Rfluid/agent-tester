@@ -40,6 +40,25 @@ interface TimingRecord {
     finalAt?: string; // final message arrival time
 }
 
+// For shareable state (does NOT include secrets like OpenAI key)
+interface SharePayload {
+    version: 1;
+    cfg: {
+        agentUrl: string;
+        threadId: string;
+        maxRetries: number;
+        loopThreshold: number;
+        topK: number;
+        numTurns: number;
+        turnDelayMs: number;
+        mockPrompt: string;
+        openaiModel: string;
+    };
+    conversation: ConversationItem[];
+    timings: Record<string, TimingRecord>;
+    completedTurns: number;
+}
+
 // Utilities
 const isoNow = () => new Date().toISOString(); // includes ms
 const uuid = () => crypto.randomUUID();
@@ -56,10 +75,70 @@ const useLocalStorage = <T,>(key: string, initial: T) => {
     return [value, setValue] as const;
 };
 
+// --- Base64 helpers (URL-safe) ---
+function bytesToBinaryString(bytes: Uint8Array): string {
+    const chunkSize = 0x8000;
+    let result = "";
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        result += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)));
+    }
+    return result;
+}
+function binaryStringToBytes(bin: string): Uint8Array {
+    const len = bin.length;
+    const out = new Uint8Array(len);
+    for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i) & 0xff;
+    return out;
+}
+function base64UrlEncode(bytes: Uint8Array): string {
+    const b64 = btoa(bytesToBinaryString(bytes));
+    return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function base64UrlDecode(s: string): Uint8Array {
+    const pad = s.length % 4 === 2 ? "==" : s.length % 4 === 3 ? "=" : "";
+    const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + pad;
+    const bin = atob(b64);
+    return binaryStringToBytes(bin);
+}
+
+// Try gzip via CompressionStream/DecompressionStream; fall back to plain UTF-8 base64
+async function gzipCompress(text: string): Promise<Uint8Array> {
+    if ("CompressionStream" in window) {
+        const cs = new CompressionStream("gzip");
+        const writer = (cs.writable as WritableStream<Uint8Array>).getWriter();
+        writer.write(new TextEncoder().encode(text));
+        await writer.close();
+        const resp = new Response(cs.readable);
+        return new Uint8Array(await resp.arrayBuffer());
+    }
+    // Fallback: return UTF-8 bytes (no compression)
+    return new TextEncoder().encode(text);
+}
+async function gzipDecompress(bytes: Uint8Array): Promise<string> {
+    if ("DecompressionStream" in window) {
+        const ds = new DecompressionStream("gzip");
+        const writer = (ds.writable as WritableStream<Uint8Array>).getWriter();
+        writer.write(bytes);
+        await writer.close();
+        const resp = new Response(ds.readable);
+        const ab = await resp.arrayBuffer();
+        return new TextDecoder().decode(ab);
+    }
+    // Fallback: treat as UTF-8 text
+    return new TextDecoder().decode(bytes);
+}
+
+function shareTokenPrefix(compressed: boolean) {
+    return compressed ? "gz." : "b64.";
+}
+function isGzipCapable() {
+    return "CompressionStream" in window && "DecompressionStream" in window;
+}
+
 // --- Main App ---
 export default function App() {
     const [agentUrl, setAgentUrl] = useLocalStorage("agentUrl", "ws://localhost:8000/agent/ws");
-    const [openaiKey, setOpenaiKey] = useLocalStorage("openaiKey", "");
+    const [openaiKey, setOpenaiKey] = useLocalStorage("openaiKey", ""); // NOTE: never shared
     const [threadId, setThreadId] = useLocalStorage("threadId", "test-thread-001");
     const [maxRetries, setMaxRetries] = useLocalStorage("maxRetries", 3);
     const [loopThreshold, setLoopThreshold] = useLocalStorage("loopThreshold", 5);
@@ -95,6 +174,23 @@ export default function App() {
 
     // In-flight turn pointer (ensures all deltas land on the same turnId)
     const activeTurnIdRef = useRef<string | null>(null);
+
+    // progress, stop loading, and user-synthesis tracking
+    const [completedTurns, setCompletedTurns] = useState(0);
+    const [isStopping, setIsStopping] = useState(false);
+    const [isSynthesizingUser, setIsSynthesizingUser] = useState(false);
+    const isSynthUserRef = useRef(false);
+    useEffect(() => {
+        isSynthUserRef.current = isSynthesizingUser;
+    }, [isSynthesizingUser]);
+
+    // simple toast for copied links / imports
+    const [toast, setToast] = useState<string | null>(null);
+    useEffect(() => {
+        if (!toast) return;
+        const t = setTimeout(() => setToast(null), 2000);
+        return () => clearTimeout(t);
+    }, [toast]);
 
     const scrollRef = useRef<HTMLDivElement | null>(null);
     useEffect(() => {
@@ -134,7 +230,6 @@ export default function App() {
 
         const turnId = activeTurnIdRef.current;
         if (!turnId) {
-            // No active turn, ignore (or log) to avoid creating fake messages for every delta
             console.warn("Delta/final received without active turn. Event ignored:", evt);
             return;
         }
@@ -142,7 +237,6 @@ export default function App() {
         appendAgentDelta(turnId, type, data);
 
         if (type === "final") {
-            // Close the active turn – the next turn will define a new id
             activeTurnIdRef.current = null;
         }
     };
@@ -163,7 +257,6 @@ export default function App() {
             return { ...prev, [turnId]: { ...t } };
         });
 
-        // append/merge message in conversation
         setConversation((prev) => {
             const idx = prev.findIndex((m) => m.id === turnId && m.role === "agent");
             const existing = idx >= 0 ? prev[idx] : null;
@@ -188,22 +281,19 @@ export default function App() {
             return copy;
         });
 
-        // resolve waiter for this turn when final arrives
         if (type === "final") {
             const resolver = finalResolversRef.current.get(turnId);
             if (resolver) {
                 finalResolversRef.current.delete(turnId);
                 resolver();
             }
+            setCompletedTurns((n) => n + 1);
         }
     };
 
     // --- OpenAI helpers ---
-    // Robust extractor for Responses API response shapes (supports the v2025 example you sent)
     function extractTextFromResponsesPayload(json): string | null {
-        // 1) Shortcut often provided by SDKs
         if (typeof json?.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
-        // 2) Standard v4/v5 Responses: iterate `output[]` -> message -> content[] -> output_text
         const out = json?.output;
         if (Array.isArray(out)) {
             for (const item of out) {
@@ -216,7 +306,6 @@ export default function App() {
                 }
             }
         }
-        // 3) Back-compat fallbacks
         const choices0 = json?.choices?.[0]?.message?.content;
         if (typeof choices0 === "string" && choices0.trim()) return choices0.trim();
         const legacy = json?.output?.[0]?.content?.[0]?.text;
@@ -247,7 +336,6 @@ export default function App() {
         conversation: ConversationItem[];
         basePrompt: string;
     }): Promise<string> {
-        // Build a compact transcript as context (user -> user, agent -> assistant)
         const messages = [
             {
                 role: "system",
@@ -262,7 +350,6 @@ export default function App() {
             },
         ];
 
-        // Try Responses API first
         try {
             const res = await fetch("https://api.openai.com/v1/responses", {
                 method: "POST",
@@ -278,7 +365,6 @@ export default function App() {
             if (typeof text === "string" && text.trim()) return text.trim();
             throw new Error("Unexpected Responses API payload shape");
         } catch {
-            // Fallback to Chat Completions
             const res2 = await fetch("https://api.openai.com/v1/chat/completions", {
                 method: "POST",
                 headers: {
@@ -308,14 +394,28 @@ export default function App() {
             max_retries: Math.max(0, Number(maxRetries) || 0),
             loop_threshold: Math.max(1, Number(loopThreshold) || 1),
             top_k: Math.max(0, Number(topK) || 0),
-            thread_id: threadId, // same thread for all turns
-            _client_turn_id: agentTurnId, // optional if the server echoes it back
+            thread_id: threadId,
+            _client_turn_id: agentTurnId,
         };
 
         activeTurnIdRef.current = agentTurnId;
-
         wsRef.current?.send(JSON.stringify(payload));
         createTimingRecord(agentTurnId);
+    };
+
+    // wait-until-idle helper used by Stop
+    const waitUntilIdle = async () => {
+        const currentTurn = activeTurnIdRef.current;
+        if (currentTurn) {
+            try {
+                await waitForFinal(currentTurn);
+            } catch (e) {
+                console.error(e);
+            }
+        }
+        while (isSynthUserRef.current) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
     };
 
     const runTurns = async (turns: number) => {
@@ -323,7 +423,6 @@ export default function App() {
             alert("Provide your OpenAI API key to generate mock user messages.");
             return;
         }
-
         if (!wsConnected) {
             connect();
             await new Promise((r) => setTimeout(r, 250));
@@ -333,17 +432,19 @@ export default function App() {
         stopRequestedRef.current = false;
 
         try {
-            // 1st turn: if there is no conversation yet or the last message is from the agent, generate the first message from mockPrompt
             if (
                 conversationRef.current.length === 0 ||
                 conversationRef.current[conversationRef.current.length - 1].role === "agent"
             ) {
                 if (stopRequestedRef.current) throw new Error("Stopped");
+                setIsSynthesizingUser(true);
                 const firstMsg = await generateFirstUserMessage({
                     apiKey: openaiKey,
                     model: openaiModel,
                     prompt: mockPrompt,
                 });
+                setIsSynthesizingUser(false);
+
                 const userTurnId = uuid();
                 setConversation((prev) => [...prev, { id: userTurnId, role: "user", text: firstMsg, at: isoNow() }]);
 
@@ -353,18 +454,17 @@ export default function App() {
                 if (turnDelayMs > 0) await new Promise((r) => setTimeout(r, turnDelayMs));
             }
 
-            // remaining turns - 1
             let remaining = Math.max(0, turns - 1);
             while (remaining-- > 0) {
                 if (stopRequestedRef.current) break;
-
-                // generate the next user message based on the CURRENT history
+                setIsSynthesizingUser(true);
                 const nextMsg = await generateNextUserMessage({
                     apiKey: openaiKey,
                     model: openaiModel,
                     conversation: conversationRef.current,
                     basePrompt: mockPrompt,
                 });
+                setIsSynthesizingUser(false);
 
                 const userTurnId = uuid();
                 setConversation((prev) => [...prev, { id: userTurnId, role: "user", text: nextMsg, at: isoNow() }]);
@@ -382,38 +482,152 @@ export default function App() {
         }
     };
 
-    // Original single-run for compatibility
+    // Single-run
     const startTest = async () => {
         if (!wsConnected) {
             connect();
-            // Give a small delay to allow onopen to fire before sending
             await new Promise((r) => setTimeout(r, 250));
         }
-
         if (!openaiKey) {
             alert("Provide your OpenAI API key to generate the initial message.");
             return;
         }
-
         setIsGenerating(true);
+        setIsSynthesizingUser(true);
         try {
             const userMsg = await generateFirstUserMessage({
                 apiKey: openaiKey,
                 model: openaiModel,
                 prompt: mockPrompt,
             });
-
             const userTurnId = uuid();
             setConversation((prev) => [...prev, { id: userTurnId, role: "user", text: userMsg, at: isoNow() }]);
-
             const agentTurnId = uuid();
             sendToAgent(userMsg, agentTurnId);
         } catch (e: unknown) {
             console.error(e);
             alert("Failed to generate initial message with the OpenAI API. Check console.");
         } finally {
+            setIsSynthesizingUser(false);
             setIsGenerating(false);
         }
+    };
+
+    // Stop & Continue
+    const handleStop = async () => {
+        setIsStopping(true);
+        stopRequestedRef.current = true;
+        try {
+            await waitUntilIdle();
+        } finally {
+            setIsStopping(false);
+            setIsRunning(false);
+        }
+    };
+
+    const handleContinue = async () => {
+        const remaining = Math.max(0, Number(numTurns) - Number(completedTurns));
+        if (remaining <= 0) return;
+        await runTurns(remaining);
+    };
+
+    // --- Shareable URL encode/decode ---
+    const collectSharePayload = (): SharePayload => ({
+        version: 1,
+        cfg: {
+            agentUrl,
+            threadId,
+            maxRetries,
+            loopThreshold,
+            topK,
+            numTurns,
+            turnDelayMs,
+            mockPrompt,
+            openaiModel,
+        },
+        conversation,
+        timings,
+        completedTurns,
+    });
+
+    const importSharePayload = (p: SharePayload) => {
+        // config
+        setAgentUrl(p.cfg.agentUrl);
+        setThreadId(p.cfg.threadId);
+        setMaxRetries(p.cfg.maxRetries);
+        setLoopThreshold(p.cfg.loopThreshold);
+        setTopK(p.cfg.topK);
+        setNumTurns(p.cfg.numTurns);
+        setTurnDelayMs(p.cfg.turnDelayMs);
+        setMockPrompt(p.cfg.mockPrompt);
+        setOpenaiModel(p.cfg.openaiModel);
+        // state
+        setConversation(p.conversation || []);
+        setTimings(p.timings || {});
+        setCompletedTurns(p.completedTurns || 0);
+        // reset run flags
+        setIsRunning(false);
+        stopRequestedRef.current = false;
+        activeTurnIdRef.current = null;
+    };
+
+    async function buildShareLink() {
+        const payload = collectSharePayload();
+        const json = JSON.stringify(payload);
+        const gzipSupported = isGzipCapable();
+        const bytes = await gzipCompress(json);
+        const token = shareTokenPrefix(gzipSupported) + base64UrlEncode(bytes);
+        const url = `${location.origin}${location.pathname}#s=${token}`;
+        try {
+            await navigator.clipboard.writeText(url);
+            setToast("Shareable link copied to clipboard");
+        } catch {
+            setToast("Share URL ready in address bar hash");
+        }
+        // Also set the hash so user can see/copy
+        history.replaceState(null, "", `#s=${token}`);
+    }
+
+    async function tryImportFromHash() {
+        const m = location.hash.match(/#s=([^&]+)/);
+        if (!m) return;
+        const token = decodeURIComponent(m[1]);
+        const isGz = token.startsWith("gz.");
+        const isB64 = token.startsWith("b64.");
+        if (!isGz && !isB64) return;
+        const raw = token.slice(isGz ? 3 : 4);
+        const bytes = base64UrlDecode(raw);
+        try {
+            const text = await (isGz ? gzipDecompress(bytes) : Promise.resolve(new TextDecoder().decode(bytes)));
+            const parsed = JSON.parse(text) as SharePayload;
+            if (parsed?.version === 1) {
+                importSharePayload(parsed);
+                setToast("Session imported from link");
+            }
+        } catch (e) {
+            console.warn("Failed to import session from URL:", e);
+            setToast("Invalid or corrupted share link");
+        }
+    }
+
+    useEffect(() => {
+        tryImportFromHash();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Clear conversation + timings and start a fresh session (new threadId)
+    const clearAndNewSession = () => {
+        setConversation([]);
+        setTimings({});
+        setCompletedTurns(0);
+        setIsRunning(false);
+        stopRequestedRef.current = false;
+        activeTurnIdRef.current = null;
+        const newTid = `session-${uuid()}`;
+        setThreadId(newTid);
+        // clear hash so URL doesn't re-import old session
+        history.replaceState(null, "", location.pathname);
+        setToast("New session started (cleared history)");
     };
 
     const exportReport = () => {
@@ -436,10 +650,19 @@ export default function App() {
                         <h1 className="text-2xl font-semibold">Agent Tester</h1>
                         <p className="text-sm text-slate-600">
                             Generate messages via OpenAI, send them to your agent over WebSocket, monitor deltas/final,
-                            and export metrics.
+                            and export/share sessions.
                         </p>
+                        <p className="text-xs text-slate-600 mt-1">
+                            Progress: <span className="font-mono">{completedTurns}</span>/
+                            <span className="font-mono">{numTurns}</span> turns
+                        </p>
+                        {toast && (
+                            <div className="mt-2 inline-block rounded-xl border px-3 py-1 text-xs bg-white shadow">
+                                {toast}
+                            </div>
+                        )}
                     </div>
-                    <div className="flex gap-3">
+                    <div className="flex flex-wrap gap-3">
                         {!wsConnected ? (
                             <button
                                 onClick={connect}
@@ -460,6 +683,18 @@ export default function App() {
                             className="px-3 py-2 rounded-2xl shadow bg-white border hover:bg-slate-50"
                         >
                             Export JSON
+                        </button>
+                        <button
+                            onClick={buildShareLink}
+                            className="px-3 py-2 rounded-2xl shadow bg-white border hover:bg-slate-50"
+                        >
+                            Share link
+                        </button>
+                        <button
+                            onClick={clearAndNewSession}
+                            className="px-3 py-2 rounded-2xl shadow bg-white border hover:bg-slate-50"
+                        >
+                            Clear & New Session
                         </button>
                     </div>
                 </header>
@@ -582,10 +817,13 @@ export default function App() {
                                 className="mt-1 w-full rounded-xl border px-3 py-2"
                             />
                         </label>
-                        <div className="flex gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                             {!isRunning ? (
                                 <button
-                                    onClick={() => runTurns(numTurns)}
+                                    onClick={() => {
+                                        setCompletedTurns(0);
+                                        runTurns(numTurns);
+                                    }}
                                     disabled={!openaiKey}
                                     className="px-3 py-2 rounded-2xl shadow bg-emerald-600 text-white disabled:opacity-50"
                                 >
@@ -593,14 +831,26 @@ export default function App() {
                                 </button>
                             ) : (
                                 <button
-                                    onClick={() => {
-                                        stopRequestedRef.current = true;
-                                    }}
-                                    className="px-3 py-2 rounded-2xl shadow bg-red-600 text-white"
+                                    onClick={handleStop}
+                                    disabled={isStopping}
+                                    className="px-3 py-2 rounded-2xl shadow bg-red-600 text-white disabled:opacity-50"
                                 >
-                                    Stop
+                                    {isStopping ? "Stopping…" : "Stop"}
                                 </button>
                             )}
+
+                            {!isRunning && completedTurns < numTurns && (
+                                <button
+                                    onClick={handleContinue}
+                                    className="px-3 py-2 rounded-2xl shadow bg-slate-900 text-white"
+                                >
+                                    Continue
+                                </button>
+                            )}
+
+                            <span className="text-xs text-slate-600 ml-2">
+                                {completedTurns}/{numTurns} turns generated
+                            </span>
                         </div>
                     </div>
                 </section>
@@ -659,7 +909,8 @@ export default function App() {
                         <code>response</code> text and stores timestamps for <em>requested</em>, first <em>delta</em>,
                         and <em>final</em>. Extra data (<code>action_payloads</code>, <code>next_step</code>,{" "}
                         <code>next_step_reason</code>) is accessible in the agent bubbles. When running multiple turns,
-                        the same <code>thread_id</code> is used to preserve context.
+                        the same <code>thread_id</code> is used to preserve context. Share links include config,
+                        history, and timings (never your API key).
                     </p>
                 </footer>
             </div>
