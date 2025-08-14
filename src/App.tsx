@@ -1,6 +1,58 @@
 import { useEffect, useRef, useState } from "react";
 import "./index.css";
 
+// ---- Shareable session helpers ----
+
+// URL-safe base64 (no padding, - _ instead of + /)
+const toUrlB64 = (s: string) =>
+    btoa(encodeURIComponent(s).replace(/%([0-9A-F]{2})/g, (_, p1) => String.fromCharCode(parseInt(p1, 16))))
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+
+const fromUrlB64 = (b64: string) => {
+    const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
+    const norm = b64.replace(/-/g, "+").replace(/_/g, "/") + pad;
+    const str = atob(norm);
+    // decodeURIComponent for the earlier encodeURIComponent
+    const escaped = Array.prototype.map
+        .call(str, (c: string) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join("");
+    return decodeURIComponent(escaped);
+};
+
+async function copyToClipboard(text: string) {
+    // Try modern API
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (e) {
+        console.error(e);
+    }
+    // Fallback via hidden textarea
+    try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        ta.style.top = "0";
+        ta.setAttribute("readonly", "true");
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        if (ok) return true;
+    } catch (e) {
+        console.error(e);
+    }
+    // Last resort: prompt (lets user Cmd/Ctrl+C)
+    window.prompt("Copy this link:", text);
+    return false;
+}
+
 // --- Types coming from your agent contract ---
 
 type WebSocketData = "delta" | "final";
@@ -40,25 +92,6 @@ interface TimingRecord {
     finalAt?: string; // final message arrival time
 }
 
-// For shareable state (does NOT include secrets like OpenAI key)
-interface SharePayload {
-    version: 1;
-    cfg: {
-        agentUrl: string;
-        threadId: string;
-        maxRetries: number;
-        loopThreshold: number;
-        topK: number;
-        numTurns: number;
-        turnDelayMs: number;
-        mockPrompt: string;
-        openaiModel: string;
-    };
-    conversation: ConversationItem[];
-    timings: Record<string, TimingRecord>;
-    completedTurns: number;
-}
-
 // Utilities
 const isoNow = () => new Date().toISOString(); // includes ms
 const uuid = () => crypto.randomUUID();
@@ -74,66 +107,6 @@ const useLocalStorage = <T,>(key: string, initial: T) => {
     }, [key, value]);
     return [value, setValue] as const;
 };
-
-// --- Base64 helpers (URL-safe) ---
-function bytesToBinaryString(bytes: Uint8Array): string {
-    const chunkSize = 0x8000;
-    let result = "";
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-        result += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)));
-    }
-    return result;
-}
-function binaryStringToBytes(bin: string): Uint8Array {
-    const len = bin.length;
-    const out = new Uint8Array(len);
-    for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i) & 0xff;
-    return out;
-}
-function base64UrlEncode(bytes: Uint8Array): string {
-    const b64 = btoa(bytesToBinaryString(bytes));
-    return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-function base64UrlDecode(s: string): Uint8Array {
-    const pad = s.length % 4 === 2 ? "==" : s.length % 4 === 3 ? "=" : "";
-    const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + pad;
-    const bin = atob(b64);
-    return binaryStringToBytes(bin);
-}
-
-// Try gzip via CompressionStream/DecompressionStream; fall back to plain UTF-8 base64
-async function gzipCompress(text: string): Promise<Uint8Array> {
-    if ("CompressionStream" in window) {
-        const cs = new CompressionStream("gzip");
-        const writer = (cs.writable as WritableStream<Uint8Array>).getWriter();
-        writer.write(new TextEncoder().encode(text));
-        await writer.close();
-        const resp = new Response(cs.readable);
-        return new Uint8Array(await resp.arrayBuffer());
-    }
-    // Fallback: return UTF-8 bytes (no compression)
-    return new TextEncoder().encode(text);
-}
-async function gzipDecompress(bytes: Uint8Array): Promise<string> {
-    if ("DecompressionStream" in window) {
-        const ds = new DecompressionStream("gzip");
-        const writer = (ds.writable as WritableStream<Uint8Array>).getWriter();
-        writer.write(bytes);
-        await writer.close();
-        const resp = new Response(ds.readable);
-        const ab = await resp.arrayBuffer();
-        return new TextDecoder().decode(ab);
-    }
-    // Fallback: treat as UTF-8 text
-    return new TextDecoder().decode(bytes);
-}
-
-function shareTokenPrefix(compressed: boolean) {
-    return compressed ? "gz." : "b64.";
-}
-function isGzipCapable() {
-    return "CompressionStream" in window && "DecompressionStream" in window;
-}
 
 // --- Main App ---
 export default function App() {
@@ -531,103 +504,102 @@ export default function App() {
         await runTurns(remaining);
     };
 
-    // --- Shareable URL encode/decode ---
-    const collectSharePayload = (): SharePayload => ({
-        version: 1,
-        cfg: {
-            agentUrl,
-            threadId,
-            maxRetries,
-            loopThreshold,
-            topK,
-            numTurns,
-            turnDelayMs,
-            mockPrompt,
-            openaiModel,
-        },
-        conversation,
-        timings,
-        completedTurns,
-    });
+    function serializeSession() {
+        return {
+            v: 1,
+            config: {
+                agentUrl,
+                threadId,
+                maxRetries,
+                loopThreshold,
+                topK,
+                numTurns,
+                turnDelayMs,
+                mockPrompt,
+                openaiModel,
+                // DO NOT include openaiKey
+            },
+            conversation,
+            timings,
+            completedTurns,
+        };
+    }
 
-    const importSharePayload = (p: SharePayload) => {
-        // config
-        setAgentUrl(p.cfg.agentUrl);
-        setThreadId(p.cfg.threadId);
-        setMaxRetries(p.cfg.maxRetries);
-        setLoopThreshold(p.cfg.loopThreshold);
-        setTopK(p.cfg.topK);
-        setNumTurns(p.cfg.numTurns);
-        setTurnDelayMs(p.cfg.turnDelayMs);
-        setMockPrompt(p.cfg.mockPrompt);
-        setOpenaiModel(p.cfg.openaiModel);
-        // state
-        setConversation(p.conversation || []);
-        setTimings(p.timings || {});
-        setCompletedTurns(p.completedTurns || 0);
-        // reset run flags
-        setIsRunning(false);
-        stopRequestedRef.current = false;
-        activeTurnIdRef.current = null;
+    function applySession(s) {
+        if (!s || typeof s !== "object") return;
+        const { config, conversation: conv, timings: tmg, completedTurns: ct } = s;
+        if (config) {
+            setAgentUrl(config.agentUrl ?? agentUrl);
+            setThreadId(config.threadId ?? threadId);
+            setMaxRetries(config.maxRetries ?? maxRetries);
+            setLoopThreshold(config.loopThreshold ?? loopThreshold);
+            setTopK(config.topK ?? topK);
+            setNumTurns(config.numTurns ?? numTurns);
+            setTurnDelayMs(config.turnDelayMs ?? turnDelayMs);
+            setMockPrompt(config.mockPrompt ?? mockPrompt);
+            setOpenaiModel(config.openaiModel ?? openaiModel);
+        }
+        if (Array.isArray(conv)) setConversation(conv);
+        if (tmg && typeof tmg === "object") setTimings(tmg);
+        if (typeof ct === "number") setCompletedTurns(ct);
+    }
+
+    const shareSession = async () => {
+        try {
+            const payload = serializeSession();
+            const json = JSON.stringify(payload);
+            const token = toUrlB64(json);
+            const url = `${location.origin}${location.pathname}#s=${token}`;
+            const ok = await copyToClipboard(url);
+            if (!ok) alert("Link shown; copy it manually.");
+        } catch (e) {
+            console.error(e);
+            alert("Failed to generate share link. See console.");
+        }
     };
 
-    async function buildShareLink() {
-        const payload = collectSharePayload();
-        const json = JSON.stringify(payload);
-        const gzipSupported = isGzipCapable();
-        const bytes = await gzipCompress(json);
-        const token = shareTokenPrefix(gzipSupported) + base64UrlEncode(bytes);
-        const url = `${location.origin}${location.pathname}#s=${token}`;
+    const importSessionFromHash = () => {
+        const { hash } = location;
+        if (!hash.startsWith("#s=")) return false;
         try {
-            await navigator.clipboard.writeText(url);
-            setToast("Shareable link copied to clipboard");
-        } catch {
-            setToast("Share URL ready in address bar hash");
-        }
-        // Also set the hash so user can see/copy
-        history.replaceState(null, "", `#s=${token}`);
-    }
-
-    async function tryImportFromHash() {
-        const m = location.hash.match(/#s=([^&]+)/);
-        if (!m) return;
-        const token = decodeURIComponent(m[1]);
-        const isGz = token.startsWith("gz.");
-        const isB64 = token.startsWith("b64.");
-        if (!isGz && !isB64) return;
-        const raw = token.slice(isGz ? 3 : 4);
-        const bytes = base64UrlDecode(raw);
-        try {
-            const text = await (isGz ? gzipDecompress(bytes) : Promise.resolve(new TextDecoder().decode(bytes)));
-            const parsed = JSON.parse(text) as SharePayload;
-            if (parsed?.version === 1) {
-                importSharePayload(parsed);
-                setToast("Session imported from link");
-            }
+            const token = hash.slice(3);
+            const json = fromUrlB64(token);
+            const data = JSON.parse(json);
+            applySession(data);
+            return true;
         } catch (e) {
-            console.warn("Failed to import session from URL:", e);
-            setToast("Invalid or corrupted share link");
+            console.warn("Invalid shared session in URL.", e);
+            return false;
         }
-    }
+    };
 
     useEffect(() => {
-        tryImportFromHash();
+        if (importSessionFromHash()) {
+            // Optional: notify user
+            console.log("Imported session from link.");
+        }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     // Clear conversation + timings and start a fresh session (new threadId)
     const clearAndNewSession = () => {
+        // stop any running flows
+        stopRequestedRef.current = true;
+        activeTurnIdRef.current = null;
+
         setConversation([]);
         setTimings({});
         setCompletedTurns(0);
-        setIsRunning(false);
-        stopRequestedRef.current = false;
-        activeTurnIdRef.current = null;
-        const newTid = `session-${uuid()}`;
+
+        // new thread id to force a cold context on the server
+        const newTid = uuid();
         setThreadId(newTid);
-        // clear hash so URL doesn't re-import old session
+
+        // remove share hash
         history.replaceState(null, "", location.pathname);
-        setToast("New session started (cleared history)");
+
+        // (optional) disconnect socket so the server sees a fresh start
+        // disconnect(); // uncomment if you prefer a hard reset
     };
 
     const exportReport = () => {
@@ -662,7 +634,7 @@ export default function App() {
                             </div>
                         )}
                     </div>
-                    <div className="flex flex-wrap gap-3">
+                    <div className="flex gap-3">
                         {!wsConnected ? (
                             <button
                                 onClick={connect}
@@ -678,18 +650,21 @@ export default function App() {
                                 Disconnect WS
                             </button>
                         )}
+
                         <button
                             onClick={exportReport}
                             className="px-3 py-2 rounded-2xl shadow bg-white border hover:bg-slate-50"
                         >
                             Export JSON
                         </button>
+
                         <button
-                            onClick={buildShareLink}
+                            onClick={shareSession}
                             className="px-3 py-2 rounded-2xl shadow bg-white border hover:bg-slate-50"
                         >
                             Share link
                         </button>
+
                         <button
                             onClick={clearAndNewSession}
                             className="px-3 py-2 rounded-2xl shadow bg-white border hover:bg-slate-50"
