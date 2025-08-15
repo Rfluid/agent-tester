@@ -12,8 +12,7 @@
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-
-    @apply h-full w-full;
+    width: 100%;
 }
 
 a {

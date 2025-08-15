@@ -615,7 +615,7 @@ export default function App() {
     };
 
     return (
-        <div className="min-h-screen bg-slate-50 text-slate-900">
+        <div className="w-full min-h-screen bg-slate-50 text-slate-900">
             <div className="mx-auto px-4 py-6">
                 <header className="mb-6 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
                     <div>
